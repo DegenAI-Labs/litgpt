@@ -1006,7 +1006,7 @@ olmo = [
 configs.extend(olmo)
 
 olmo2 = [
-    # 31M olmo2. Transformer core is ~4.2M params
+    # 30M olmo2. Transformer core is ~4.2M params
     dict(
         name="OLMo-2-30M{}",
         hf_config=dict(org=None, name="custom-olmo2-30m{}"),
@@ -1190,7 +1190,6 @@ olmo2 = [
         norm_qk_type="olmo2",
         post_attention_norm=True,
     ),
-
 
     # https://huggingface.co/allenai/OLMo-2-1124-7B/blob/main/config.json
     dict(
