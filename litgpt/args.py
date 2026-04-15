@@ -38,6 +38,24 @@ class TrainArgs:
     max_norm: float | None = None
     min_lr: float = 6e-5
 
+    # WSD-S (warmup-stable-decay with intermediate checkpoints)
+    wsds_checkpoint_ratios: list[int] | None = None
+    """Token/parameter ratios to checkpoint at (e.g. [1, 2, 5, 10, 20, 50]). Enables WSD-S."""
+    wsds_base_tokens: int | None = None
+    """Base token count for ratio scaling (e.g. 30_000_000). Used when wsds_checkpoint_ratios is set."""
+    wsds_decay_fraction: float | None = None
+    """Fraction of each segment's steps used for LR decay before saving. E.g. 0.1 = last 10% decay then save."""
+
+    # WSD (warmup-stable-decay, single run, no intermediate checkpoints)
+    lr_schedule: str | None = None
+    """'cosine' (default) or 'wsd'. WSD = warmup then stable LR then decay over last fraction."""
+    lr_wsd_warmup_fraction: float | None = None
+    """For lr_schedule=wsd: fraction of run used for warmup (e.g. 0.1)."""
+    lr_wsd_warmup_steps_max: int | None = None
+    """For lr_schedule=wsd: cap on warmup steps (e.g. 2000)."""
+    lr_wsd_decay_fraction: float | None = None
+    """For lr_schedule=wsd: fraction of run for final decay (e.g. 0.1 = last 10%)."""
+
     def __post_init__(self) -> None:
         if self.lr_warmup_fraction and self.lr_warmup_steps:
             raise ValueError(

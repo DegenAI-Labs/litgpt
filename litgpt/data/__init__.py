@@ -9,12 +9,14 @@ from litgpt.data.flan import FLAN
 from litgpt.data.json_data import JSON
 from litgpt.data.lima import LIMA
 from litgpt.data.lit_data import LitData
+from litgpt.data.lit_data_multi import LitDataMulti
 from litgpt.data.longform import LongForm
 from litgpt.data.microllama import MicroLlama
 from litgpt.data.openwebtext import OpenWebText
 from litgpt.data.text_files import TextFiles
 from litgpt.data.tinyllama import TinyLlama
 from litgpt.data.tinystories import TinyStories
+from litgpt.data.tokenized_jsonl import TokenizedJSONL
 
 __all__ = [
     "Alpaca",
@@ -25,6 +27,7 @@ __all__ = [
     "JSON",
     "LIMA",
     "LitData",
+    "LitDataMulti",
     "DataModule",
     "LongForm",
     "OpenWebText",
@@ -33,5 +36,6 @@ __all__ = [
     "TinyLlama",
     "TinyStories",
     "MicroLlama",
+    "TokenizedJSONL",
     "get_sft_collate_fn",
 ]

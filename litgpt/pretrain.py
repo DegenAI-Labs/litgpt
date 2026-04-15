@@ -331,14 +331,67 @@ def fit(
     fabric.barrier()
     total_t0 = time.perf_counter()
 
-    warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
+    use_wsds = train.wsds_checkpoint_ratios is not None
+    if use_wsds:
+        segment_end_iters_list, segment_end_tokens_list, segment_ratios_list = _wsds_segment_end_iters(
+            train, train.max_tokens, tokens_per_iter, fabric.world_size
+        )
+        # If resuming, find which segment we're in
+        segment_idx = 0
+        while segment_idx < len(segment_end_iters_list) and state["iter_num"] >= segment_end_iters_list[segment_idx]:
+            segment_idx += 1
+        if segment_idx >= len(segment_end_iters_list):
+            segment_idx = len(segment_end_iters_list) - 1
+        segment_start_iter = segment_end_iters_list[segment_idx - 1] if segment_idx > 0 else 0
+        segment_end_iter = segment_end_iters_list[segment_idx]
+        segment_iters = segment_end_iter - segment_start_iter
+        decay_iters = max(0, int(segment_iters * train.wsds_decay_fraction))
+        warmup_iters = (
+            min(
+                segment_iters,
+                train.warmup_iters(devices, num_nodes, segment_iters, train_dataloader),
+            )
+            if segment_idx == 0
+            else 0
+        )
+        fabric.print(
+            f"WSD-S: {len(segment_end_tokens_list)} segments, checkpoint at tokens: {segment_end_tokens_list}"
+        )
+    else:
+        warmup_iters = train.warmup_iters(devices, num_nodes, max_iters, train_dataloader)
+
+    use_wsd_single = getattr(train, "lr_schedule", None) == "wsd" and not use_wsds
+    if use_wsd_single:
+        grad_accum = train.gradient_accumulation_iters(devices, num_nodes)
+        warmup_iters = min(
+            int(max_iters * (train.lr_wsd_warmup_fraction or 0.1)),
+            (train.lr_wsd_warmup_steps_max or 2000) * grad_accum,
+        )
+        decay_iters = max(0, int(max_iters * (train.lr_wsd_decay_fraction or 0.1)))
+        segment_start_iter = 0
+        segment_iters = max_iters
+        fabric.print(
+            f"WSD: warmup {warmup_iters} iters (10% run, max 2k steps), "
+            f"stable, then decay last {decay_iters} iters (10%)"
+        )
 
     for train_data in train_iterator:
         if state["iter_num"] >= max_iters:
             break
 
         # determine and set the learning rate for this iteration
-        lr = get_lr(optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, train.min_lr)
+        if use_wsds or use_wsd_single:
+            lr = get_lr_wsds(
+                optimizer.defaults["lr"],
+                train.min_lr,
+                state["iter_num"],
+                segment_start_iter,
+                segment_iters,
+                decay_iters,
+                warmup_iters,
+            )
+        else:
+            lr = get_lr(optimizer.defaults["lr"], state["iter_num"], warmup_iters, max_iters, train.min_lr)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -414,6 +467,23 @@ def fit(
         if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
             save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
 
+        if use_wsds and state["iter_num"] >= segment_end_iter:
+            checkpoint_tokens = segment_end_tokens_list[segment_idx]
+            ratio = segment_ratios_list[segment_idx]
+            save_checkpoint(
+                fabric,
+                state,
+                tokenizer_dir,
+                out_dir / f"{ratio}x" / "lit_model.pth",
+            )
+            segment_idx += 1
+            if segment_idx < len(segment_end_iters_list):
+                segment_start_iter = segment_end_iter
+                segment_end_iter = segment_end_iters_list[segment_idx]
+                segment_iters = segment_end_iter - segment_start_iter
+                decay_iters = max(0, int(segment_iters * train.wsds_decay_fraction))
+                warmup_iters = 0
+
     # Final validation
     if eval.final_validation:
         val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
@@ -474,6 +544,45 @@ def get_lr(learning_rate: float, it: int, warmup_iters: int, max_iters: int, min
     return min_lr + coeff * (learning_rate - min_lr)
 
 
+def get_lr_wsds(
+    learning_rate: float,
+    min_lr: float,
+    it: int,
+    segment_start_iter: int,
+    segment_iters: int,
+    decay_iters: int,
+    warmup_iters: int,
+) -> float:
+    """WSD-S: warmup (first segment only), stable LR, then cosine decay over last decay_iters of segment."""
+    local_it = it - segment_start_iter
+    if local_it < warmup_iters:
+        return learning_rate * local_it / warmup_iters if warmup_iters > 0 else learning_rate
+    if local_it >= segment_iters - decay_iters:
+        decay_start = segment_iters - decay_iters
+        progress = (local_it - decay_start) / decay_iters if decay_iters > 0 else 1.0
+        progress = min(1.0, progress)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr + coeff * (learning_rate - min_lr)
+    return learning_rate
+
+
+def _wsds_segment_end_iters(
+    train: TrainArgs,
+    max_tokens: int,
+    tokens_per_iter: int,
+    world_size: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """Returns (segment_end_iters, segment_end_tokens, segment_ratios) for WSD-S. Ratio = tokens/base."""
+    base = train.wsds_base_tokens
+    ratios = train.wsds_checkpoint_ratios
+    checkpoint_tokens = sorted(set(base * r for r in ratios) | {max_tokens})
+    checkpoint_tokens = [t for t in checkpoint_tokens if t <= max_tokens]
+    segment_ratios = [t // base for t in checkpoint_tokens]
+    tokens_per_step = tokens_per_iter * world_size
+    segment_end_iters = [t // tokens_per_step for t in checkpoint_tokens]
+    return segment_end_iters, checkpoint_tokens, segment_ratios
+
+
 def initialize_weights(fabric: L.Fabric, model: GPT, n_layer: int, n_embd: int) -> None:
     """GPT-NeoX weight initialization (https://arxiv.org/abs/2204.06745)."""
     # Adapted from https://github.com/jzhang38/TinyLlama
@@ -526,6 +635,14 @@ def validate_args(train: TrainArgs, eval: EvalArgs, initial_checkpoint_dir, resu
         for name in names:
             if getattr(args, name) is None:
                 issues.append(f"{__file__} requires the {name!r} argument. This is set in {args}")
+    if train.wsds_checkpoint_ratios is not None:
+        if train.wsds_base_tokens is None or train.wsds_decay_fraction is None:
+            issues.append(
+                "WSD-S requires train.wsds_base_tokens and train.wsds_decay_fraction when "
+                "train.wsds_checkpoint_ratios is set."
+            )
+        if not (0 < train.wsds_decay_fraction < 1):
+            issues.append("train.wsds_decay_fraction must be between 0 and 1 (exclusive).")
     if initial_checkpoint_dir and resume:
         issues.append("Can't provide both `--resume` and `--initial_checkpoint_dir`. Choose one.")
     if issues:

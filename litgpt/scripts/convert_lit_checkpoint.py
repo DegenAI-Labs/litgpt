@@ -1,6 +1,7 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 import gc
+import json
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
@@ -406,7 +407,10 @@ def copy_weights_olmo2(
         "transformer.h.{}.attn.norm_k.weight": "model.layers.{}.self_attn.k_norm.weight",
         "transformer.h.{}.norm_2.weight": "model.layers.{}.post_attention_layernorm.weight",
         "transformer.h.{}.norm_2.bias": "model.layers.{}.post_attention_layernorm.bias",
+        "transformer.h.{}.post_attention_norm.weight": "model.layers.{}.post_attention_layernorm.weight",
+        "transformer.h.{}.post_attention_norm.bias": "model.layers.{}.post_attention_layernorm.bias",
         "transformer.h.{}.post_mlp_norm.weight": "model.layers.{}.post_feedforward_layernorm.weight",
+        "transformer.h.{}.post_mlp_norm.bias": "model.layers.{}.post_feedforward_layernorm.bias",
         "transformer.ln_f.weight": "model.norm.weight",
         "transformer.ln_f.bias": "model.norm.bias",
         "lm_head.weight": "lm_head.weight",
@@ -541,6 +545,75 @@ def check_conversion_supported(lit_weights: dict[str, torch.Tensor]) -> None:
         raise NotImplementedError("Converting adapter models is not supported.")
 
 
+def create_hf_config(config: Config) -> Dict:
+    """Create a HuggingFace config.json from a LitGPT Config."""
+    # Determine model type and architecture
+    if config.name.lower().startswith("olmo-2-"):
+        model_type = "olmo2"
+        architectures = ["Olmo2ForCausalLM"]
+    elif config.name.lower().startswith("qwen"):
+        model_type = "qwen2"
+        architectures = ["Qwen2ForCausalLM"]
+    elif "llama" in config.name.lower() or config.mlp_class_name == "LLaMAMLP":
+        model_type = "llama"
+        architectures = ["LlamaForCausalLM"]
+    elif "gemma" in config.name.lower():
+        model_type = "gemma"
+        architectures = ["GemmaForCausalLM"]
+    elif "phi" in config.name.lower():
+        model_type = "phi"
+        architectures = ["PhiForCausalLM"]
+    elif "falcon" in config.name.lower():
+        model_type = "falcon"
+        architectures = ["FalconForCausalLM"]
+    else:
+        model_type = "gpt_neox"
+        architectures = ["GPTNeoXForCausalLM"]
+
+    hf_config = {
+        "architectures": architectures,
+        "model_type": model_type,
+        "vocab_size": config.padded_vocab_size or config.vocab_size,
+        "max_position_embeddings": config.block_size,
+        "hidden_size": config.n_embd,
+        "intermediate_size": config.intermediate_size,
+        "num_hidden_layers": config.n_layer,
+        "num_attention_heads": config.n_head,
+        "num_key_value_heads": config.n_query_groups,
+        "hidden_act": "silu" if config.mlp_class_name in ("LLaMAMLP", "GemmaMLP") else "gelu",
+        "initializer_range": 0.02,
+        "use_cache": True,
+        "attention_bias": config.attn_bias,
+        "attention_dropout": 0.0,
+        "tie_word_embeddings": False,
+        "transformers_version": "4.57.3",
+    }
+
+    # Add model-specific fields
+    if model_type == "olmo2":
+        hf_config.update({
+            "rope_theta": config.rope_base,
+            "rope_scaling": None,
+            "rms_norm_eps": config.norm_eps,
+            "pad_token_id": config.padded_vocab_size - 1 if config.padded_vocab_size else None,
+            "eos_token_id": None,
+            "bos_token_id": None,
+        })
+    elif model_type in ("llama", "qwen2"):
+        hf_config.update({
+            "rms_norm_eps": config.norm_eps,
+            "rope_theta": config.rope_base,
+            "rope_scaling": None,
+        })
+    elif model_type == "gemma":
+        hf_config.update({
+            "rms_norm_eps": config.norm_eps,
+            "rope_theta": config.rope_base,
+        })
+
+    return hf_config
+
+
 @torch.inference_mode()
 def convert_lit_checkpoint(checkpoint_dir: Path, output_dir: Path) -> None:
     """Convert a LitGPT trained checkpoint into a Hugging Face Transformers checkpoint."""
@@ -572,6 +645,12 @@ def convert_lit_checkpoint(checkpoint_dir: Path, output_dir: Path) -> None:
     else:
         copy_fn = partial(copy_weights_gpt_neox, config)
 
+    # Create HuggingFace config.json
+    hf_config = create_hf_config(config)
+    config_path = output_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(hf_config, f, indent=2)
+
     # initialize a new empty state dict to hold our new weights
     sd = {}
     with incremental_save(output_path) as saver:
@@ -581,3 +660,17 @@ def convert_lit_checkpoint(checkpoint_dir: Path, output_dir: Path) -> None:
         copy_fn(sd, lit_weights, saver=saver)
         gc.collect()
         saver.save(sd)
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+    
+    if len(sys.argv) != 3:
+        print("Usage: python -m litgpt.scripts.convert_lit_checkpoint <checkpoint_dir> <output_dir>")
+        sys.exit(1)
+    
+    checkpoint_dir = Path(sys.argv[1])
+    output_dir = Path(sys.argv[2])
+    convert_lit_checkpoint(checkpoint_dir, output_dir)
+    print(f"✓ Conversion complete! Output saved to {output_dir}")

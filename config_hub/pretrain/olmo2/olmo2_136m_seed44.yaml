@@ -1,0 +1,62 @@
+model_name: OLMo-2-136M
+
+model_config:
+
+out_dir: models/olmo2_136m_seed44
+
+precision: bf16-true
+
+initial_checkpoint_dir:
+resume: false
+tokenizer_dir:
+
+data:
+  class_path: litgpt.data.LitDataMulti
+  init_args:
+    data_path: data/litgpt
+    train_split_names:
+      - dclm_olmo_litgpt_chunk_base
+    val_split_name: dclm_olmo_litgpt_val
+    num_workers: 32
+    seed: 44
+
+train:
+  save_interval: 10000
+  log_interval: 20
+  global_batch_size: 256
+  micro_batch_size: 8
+  lr_warmup_steps: 2000
+  max_tokens: 21000000000
+  max_steps:
+  max_seq_length: 4096
+  tie_embeddings: false
+  max_norm: 1.0
+  min_lr: 6e-5
+  wsds_checkpoint_ratios: [1, 2, 5, 10, 15, 20, 25, 50, 100, 150]
+  wsds_base_tokens: 136000000
+  wsds_decay_fraction: 0.1
+
+eval:
+  interval: 2000
+  max_new_tokens:
+  max_iters: 50
+  initial_validation: false
+  final_validation: true
+
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 3e-4
+    weight_decay: 0.1
+    betas: [0.9, 0.95]
+
+devices: 4
+num_nodes: 1
+
+logger_name: wandb
+log:
+  project: pretraining-runs
+  group: pretraining
+  run: olmo2-136m-seed44
+
+seed: 44
