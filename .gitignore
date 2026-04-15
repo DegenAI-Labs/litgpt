@@ -24,5 +24,3 @@ events.out.tfevents*
 **/custom_finetuning_dataset.json
 client.py
 **/custom_texts/
-
-karan/*
